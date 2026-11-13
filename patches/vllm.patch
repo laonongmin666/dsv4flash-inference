@@ -1,0 +1,1834 @@
+--- a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
++++ b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+@@ -148,7 +148,15 @@
+ 
+     @property
+     def _output_idx(self) -> int:
+-        return dbo_current_ubatch_id() if self.enable_dbo else 0
++        if self.enable_dbo:
++            return dbo_current_ubatch_id()
++        # A1（2026-11-01）：dual-chunk 模式下两条 chunk 在两条流上并发执行，
++        # 必须各用各的输出槽（self._output 本来就是 [None, None] 两个槽）。
++        # 否则 lane0 消费后把槽置 None，lane1 再来取就会命中 `_output[...] is not None` 断言。
++        # 这里用 lane 索引而不是加锁：加锁会把 MoE 串行化，等于放弃重叠收益。
++        from vllm.v1.worker.workspace import current_workspace_lane
++
++        return current_workspace_lane() % len(self._output)
+ 
+     @property
+     def output(self) -> torch.Tensor:
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -458,7 +458,18 @@
+                 total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+             )
+             profile_specs.extend(gather_spec * 2)
+-        current_workspace_manager().get_simultaneous(*profile_specs)
++        workspace_manager = current_workspace_manager()
++        from vllm.v1.worker.workspace import (
++            ar_dual_enabled, ar_lane_count, use_workspace_lane,
++        )
++        if ar_dual_enabled():
++            # Recovery target forwards can use every lane after capture. Reserve
++            # the same worst-case indexer buffers before profiling is finalized.
++            for lane in range(ar_lane_count()):
++                with use_workspace_lane(lane):
++                    workspace_manager.get_simultaneous(*profile_specs)
++        else:
++            workspace_manager.get_simultaneous(*profile_specs)
+ 
+         # Dummy allocation to simulate for peak logits tensor memory during inference.
+         # FP8 elements so elements == bytes
+--- a/vllm/models/deepseek_v4/attention.py
++++ b/vllm/models/deepseek_v4/attention.py
+@@ -12,6 +12,7 @@
+ from transformers import DeepseekV2Config, DeepseekV3Config
+ 
+ import vllm.envs as envs
++from vllm.v1.worker.workspace import ar_attn_serialized
+ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+ from vllm.model_executor.layers.linear import (
+     ColumnParallelLinear,
+@@ -468,6 +469,7 @@
+                     _COMPUTE_GLOBAL_TOPK_INDICES_AND_LENS_KERNEL.register_warmup()
+                     _BUILD_FLASHINFER_MIXED_SPARSE_INDICES_KERNEL.register_warmup()
+ 
++    @ar_attn_serialized
+     def forward(
+         self,
+         positions: torch.Tensor,
+@@ -496,6 +498,8 @@
+             positions,
+             attn_out,
+         )
++        from vllm.v1.worker.workspace import recovery_attention_workspace_done
++        recovery_attention_workspace_done()
+         if isinstance(attn_out, torch.Tensor):
+             attn_out = attn_out[:, : self.n_local_heads, :]
+         return self._o_proj(attn_out, positions)
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -1423,6 +1423,62 @@
+             }
+         )
+ 
++    def forward_recovery_generator(self, input_ids: torch.Tensor, positions: torch.Tensor, intermediate_tensors: IntermediateTensors | None, inputs_embeds: torch.Tensor | None=None):
++        if get_pp_group().is_first_rank:
++            if inputs_embeds is not None:
++                hidden_states = inputs_embeds
++            else:
++                hidden_states = self.embed_input_ids(input_ids)
++        else:
++            assert intermediate_tensors is not None
++            hidden_states = intermediate_tensors['hidden_states']
++        if self.use_native_mega_moe:
++            input_ids = input_ids.to(torch.int64)
++        full_num_tokens = positions.shape[0]
++        if self.use_sequence_parallel:
++            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
++                forward_context = get_forward_context()
++                forward_context.is_padding = sp_padding_mask(forward_context.is_padding, hidden_states)
++            hidden_states = sp_shard(hidden_states)
++            input_ids = sp_shard(input_ids)
++        mega_gate_metadata = None
++        if self.use_native_mega_moe:
++            mega_gate_metadata = prepare_mega_gate_routing_metadata(input_ids, has_hash_routing=self.has_local_hash_moe, image_sentinel_base_id=IMAGE_SENTINEL_BASE_ID if getattr(self.config, 'vision_n_layers', 0) > 0 else None)
++        residual, post_mix, res_mix = (None, None, None)
++        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
++        aux_hidden_states: list[torch.Tensor] = []
++        final_aux_recon: torch.Tensor | None = None
++        for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer), start=self.start_layer):
++            hidden_states, residual, post_mix, res_mix = layer(hidden_states, positions, input_ids, post_mix, res_mix, residual, mega_gate_metadata=mega_gate_metadata)
++            if idx + 1 in self.aux_hidden_state_layers:
++                aux_recon = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
++                aux_hidden_state = aux_recon.mean(dim=1)
++                if self.use_sequence_parallel:
++                    aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
++                aux_hidden_states.append(aux_hidden_state)
++                final_aux_recon = aux_recon
++            yield idx
++        if layer is not None:
++            if self.end_layer in self.aux_hidden_state_layers:
++                hidden_states = final_aux_recon
++            else:
++                hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
++        if not get_pp_group().is_last_rank:
++            return IntermediateTensors({'hidden_states': hidden_states, **self.pack_local_aux_hidden_states(aux_hidden_states)})
++        if self.use_sequence_parallel:
++            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
++        if self._mtp_hidden_buffer is not None:
++            num_tokens = hidden_states.shape[0]
++            token_offset = get_forward_context().additional_kwargs["recovery_token_offset"]
++            assert 0 <= token_offset and token_offset + num_tokens <= self._mtp_hidden_buffer.shape[0]
++            self._mtp_hidden_buffer[token_offset:token_offset + num_tokens].copy_(hidden_states.flatten(1))
++        hidden_states = hc_head_fused_kernel_tilelang(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.rms_norm_eps, self.hc_eps)
++        hidden_states = self.norm(hidden_states)
++        aux_hidden_states = remote_aux + aux_hidden_states
++        if len(aux_hidden_states) > 0:
++            return (hidden_states, aux_hidden_states)
++        return hidden_states
++
+     def forward(
+         self,
+         input_ids: torch.Tensor,
+--- a/vllm/third_party/deep_gemm/include/deep_gemm/impls/sm120_fp8_mqa_logits.cuh
++++ b/vllm/third_party/deep_gemm/include/deep_gemm/impls/sm120_fp8_mqa_logits.cuh
+@@ -250,7 +250,7 @@
+                 sm120::SwizzleContext<kSwizzleMode> a_ctx;
+                 a_ctx.init(a_row + warp_idx * MMA_M, kSMEMKBytes);
+ 
+-                #pragma unroll
++                #pragma unroll 1
+                 for (uint32_t qi = 0; qi < BLOCK_Q; ++ qi) {
+                     float partial_0 = 0.0f, partial_1 = 0.0f;
+ 
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla.py
+@@ -11,6 +11,7 @@
+     get_trtllm_gen_multi_ctas_kv_counter_bytes,
+ )
+ 
++from vllm.v1.worker.workspace import ar_attn_serialized
+ from vllm.config import get_current_vllm_config
+ from vllm.config.cache import CacheDType
+ from vllm.logger import init_logger
+@@ -71,22 +72,28 @@
+ FLASHINFER_MLA_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
+ FLASHINFER_MLA_LSE_WORKSPACE_BUFFER_SIZE = 256 * 1024 * 1024
+ 
+-_fi_workspace: torch.Tensor | None = None
++_fi_workspaces: dict[int, torch.Tensor] = {}
+ 
+ 
+ def _get_workspace_buffer(return_lse: bool) -> torch.Tensor:
+-    global _fi_workspace
+-
++    # A1：同 sparse 版，按 workspace lane 分块（dual 关闭时恒 lane 0 ⇒ 与 stock 等价）。
++    from vllm.v1.worker.workspace import current_workspace_lane
++
++    from vllm.v1.worker.workspace import ar_attn_serial_enabled
++
++    lane = 0 if ar_attn_serial_enabled() else current_workspace_lane()
+     buffer_size = (
+         FLASHINFER_MLA_LSE_WORKSPACE_BUFFER_SIZE
+         if return_lse
+         else FLASHINFER_MLA_WORKSPACE_BUFFER_SIZE
+     )
+-    if _fi_workspace is None or _fi_workspace.numel() < buffer_size:
++    workspace = _fi_workspaces.get(lane)
++    if workspace is None or workspace.numel() < buffer_size:
+         # FlashInfer's CuteDSL MLA-decode tactic requires an int8 workspace;
+         # the trtllm-gen path views it as uint8, so int8 is safe for all backends.
+-        _fi_workspace = torch.zeros(buffer_size, dtype=torch.int8, device="cuda")
+-    return _fi_workspace
++        workspace = torch.zeros(buffer_size, dtype=torch.int8, device="cuda")
++        _fi_workspaces[lane] = workspace
++    return workspace
+ 
+ 
+ _fi_multi_ctas_kv_counter: torch.Tensor | None = None
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
+@@ -9,6 +9,7 @@
+ import torch
+ 
+ from vllm import envs
++from vllm.v1.worker.workspace import ar_attn_serialized
+ from vllm.config import VllmConfig
+ from vllm.config.cache import CacheDType
+ from vllm.logger import init_logger
+@@ -320,7 +321,7 @@
+ 
+ 
+ # Global workspace buffer (lazily initialized)
+-_fi_sparse_workspace: torch.Tensor | None = None
++_fi_sparse_workspaces: dict[int, torch.Tensor] = {}
+ 
+ # trtllm-gen carves a softmax-stats slab from the workspace whenever LSE is
+ # requested (FlashInfer csrc/trtllm_fmha_kernel_launcher.cu, unchanged from
+@@ -403,21 +404,31 @@
+ def _get_workspace_buffer(
+     device: torch.device, min_bytes: int | None = None
+ ) -> torch.Tensor:
+-    global _fi_sparse_workspace
++    # A1：原来是**进程级全局**的单份 workspace。两条 lane 并发跑 MLA 会写同一块
++    # scratch ⇒ 不崩但静默算错（与 b12x 共享 scratch 同型）。这里按 workspace lane 分块：
++    # lane 0 就是原来那一份；dual 关闭时 current_workspace_lane() 恒 0 ⇒ 行为与 stock 等价。
++    from vllm.v1.worker.workspace import current_workspace_lane
++
++    # 串行退路下 attention 不并发 ⇒ 共用一块即可（省 394 MiB/lane）
++    from vllm.v1.worker.workspace import ar_attn_serial_enabled
++
++    lane = 0 if ar_attn_serial_enabled() else current_workspace_lane()
+     required = (
+         min_bytes
+         if min_bytes is not None
+         else envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE
+     )
+-    if _fi_sparse_workspace is None or _fi_sparse_workspace.numel() < required:
++    workspace = _fi_sparse_workspaces.get(lane)
++    if workspace is None or workspace.numel() < required:
+         # FlashInfer's CuteDSL MLA-decode tactic requires an int8 workspace;
+         # the trtllm-gen path views it as uint8, so int8 is safe for all backends.
+-        _fi_sparse_workspace = torch.zeros(
++        workspace = torch.zeros(
+             required,
+             dtype=torch.int8,
+             device=device,
+         )
+-    return _fi_sparse_workspace
++        _fi_sparse_workspaces[lane] = workspace
++    return workspace
+ 
+ 
+ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -1,3 +1,4 @@
++import os
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from dataclasses import dataclass
+@@ -205,7 +206,9 @@
+ 
+ 
+ # Below this many rows per rank, stay replicated (TP4 engages at 64K rows).
+-MIN_TP_SHARD_ROWS_PER_RANK = 16_384
++# A overlay: lower the TP4 row gate only for long contexts.
++MIN_TP_SHARD_ROWS_PER_RANK = 512
++MIN_TP_SHARD_CONTEXT = 131_072
+ 
+ 
+ def balanced_prefill_row_shard(
+@@ -216,7 +219,13 @@
+ ) -> list[int] | None:
+     """Return contiguous TP row counts balanced by indexer MQA work."""
+     num_rows = int(query_lens_cpu.sum())
+-    if tp_size < 2 or num_rows < MIN_TP_SHARD_ROWS_PER_RANK * tp_size:
++    max_context = (int(seq_lens_cpu.max().item())
++                   if seq_lens_cpu.numel() else 0)
++    if (
++        tp_size < 2
++        or max_context < MIN_TP_SHARD_CONTEXT
++        or num_rows < MIN_TP_SHARD_ROWS_PER_RANK * tp_size
++    ):
+         return None
+ 
+     query_lens = query_lens_cpu.to(torch.int64)
+@@ -954,6 +963,32 @@
+     )
+ 
+ 
++def _sm120_native_full_decode_layout(
++    decode_lens_cpu: torch.Tensor,
++    seq_lens_cpu_upper_bound: torch.Tensor | None,
++    num_decode_tokens: int,
++    max_decode_len: int,
++) -> bool:
++    """Only full n4 rows and trailing complete null rows use native layout."""
++    lengths = decode_lens_cpu.tolist()
++    if (max_decode_len != 4 or not lengths
++            or num_decode_tokens != len(lengths) * max_decode_len):
++        return False
++    first_null = next((i for i, value in enumerate(lengths) if value == 0),
++                      len(lengths))
++    if (first_null == 0
++            or any(value != 4 for value in lengths[:first_null])
++            or any(value != 0 for value in lengths[first_null:])):
++        return False
++    if first_null < len(lengths):
++        if seq_lens_cpu_upper_bound is None:
++            raise ValueError("Native graph null padding needs CPU seq_lens bounds")
++        bounds = seq_lens_cpu_upper_bound[first_null:len(lengths)].tolist()
++        if len(bounds) != len(lengths) - first_null or any(bounds):
++            raise ValueError("Native graph null requests need zero seq_lens")
++    return True
++
++
+ def _supports_native_decode(next_n: int) -> bool:
+     """Whether decode can pass `next_n` Q rows per request to the kernel
+     instead of flattening to one single-token row per query, which re-reads
+@@ -964,6 +999,10 @@
+     if current_platform.is_device_capability_family(100):
+         return True
+     if current_platform.is_device_capability_family(90):
++        return native_next_n_supported(next_n)
++    if (current_platform.is_device_capability_family(120)
++            and os.environ.get("V4FLASH_INDEXER_SM120_NATIVE_NEXT_N") == "1"
++            and next_n == 4):
+         return native_next_n_supported(next_n)
+     return next_n in (1, 2)
+ 
+@@ -1633,10 +1672,21 @@
+             step_next_n_ok = max_decode_len <= 1 or _supports_native_decode(
+                 max_decode_len
+             )
++            sm120_native_full_decode_layout = (
++                not (self.use_flattening or self.supports_varlen)
++                and current_platform.is_device_capability_family(120)
++                and next_n == 4
++                and _sm120_native_full_decode_layout(
++                    decode_lens_cpu,
++                    common_attn_metadata.seq_lens_cpu_upper_bound,
++                    num_decode_tokens, max_decode_len)
++            )
+             use_native = (
+                 not (self.use_flattening or self.supports_varlen)
+                 and max_decode_len <= next_n
+                 and step_next_n_ok
++                and (not current_platform.is_device_capability_family(120)
++                     or next_n <= 2 or sm120_native_full_decode_layout)
+             )
+ 
+             if not self.supports_varlen:
+@@ -1708,6 +1758,10 @@
+                     )
+                 )
+ 
++            # FULL graphs retain complete native rows for trailing null requests.
++            if use_native and sm120_native_full_decode_layout:
++                requires_padding = False
++
+             # Flattening always returns a buffer view, including single-token
+             # batches. Keep its address stable across varlen graph replays.
+             seq_lens_is_buffer_view = not use_native or next_n > 1
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Callable, Iterable, Sequence
++from vllm.v1.core import kv_soft_checkpoint
+ from typing import Any
+ 
+ from vllm.distributed.kv_events import (
+@@ -194,6 +195,7 @@
+         # Callbacks for blocks released with ``unpin_blocks`` whose contents
+         # are still being read until the pool reuses them.
+         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
++        kv_soft_checkpoint.install(self)
+ 
+     def get_cached_block(
+         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+@@ -591,6 +593,8 @@
+         self,
+         block: KVCacheBlock,
+     ) -> list[BlockHashWithGroupId]:
++        if state := getattr(self, "_soft_checkpoint", None):
++            state.invalidate(block)
+         block_hashes: list[BlockHashWithGroupId] = []
+         if block.block_hash is not None:
+             block_hashes.append(block.block_hash)
+@@ -843,6 +847,8 @@
+             )
+             return False
+ 
++        if state := getattr(self, "_soft_checkpoint", None):
++            state.clear()
+         # Remove all hashes so that no new blocks will hit.
+         self.cached_block_hash_to_block = BlockHashToBlockMap()
+         self.cached_block_hashes_by_block.clear()
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -1,11 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from abc import ABC, abstractmethod
+ from collections.abc import Sequence
+ from typing import NamedTuple
+ 
+ from vllm.utils.math_utils import cdiv, round_down
+ from vllm.v1.core.block_pool import BlockPool
++from vllm.v1.core import kv_soft_checkpoint
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+ from vllm.v1.core.kv_cache_utils import (
+     BlockHash,
+@@ -15,6 +17,8 @@
+ )
+ from vllm.v1.core.single_type_kv_cache_manager import (
+     CrossAttentionManager,
++    FullAttentionManager,
++    SlidingWindowManager,
+     MambaManager,
+     SingleTypeKVCacheManager,
+     get_manager_for_kv_cache_spec,
+@@ -288,6 +292,9 @@
+             assert all(len(blocks) == 0 for blocks in new_computed_blocks)
+             return
+ 
++        kv_soft_checkpoint.admitted(self, request_id,
++                                    num_local_computed_tokens,
++                                    num_external_computed_tokens)
+         # Two-phase allocation (issue #33775): first touch every group's local
+         # cache-hit blocks, then allocate external blocks for every group. This
+         # ensures an earlier group's external `get_new_blocks` cannot evict a
+@@ -366,6 +373,25 @@
+             self.scheduler_block_size,
+             use_eagle=bool(self.eagle_group_ids),
+         )
++        if os.environ.get("V4FLASH_KV_SHARED_REPLAY") == "1":
++            # This candidate supports regular local full/SWA managers only.
++            # A mask cannot materialize a Mamba snapshot or a connector load.
++            if self.enable_partial_hash_hits or any(
++                type(manager) not in (FullAttentionManager, SlidingWindowManager)
++                or manager.dcp_world_size != 1 or manager.pcp_world_size != 1
++                for manager in self.single_type_managers
++            ):
++                raise RuntimeError("Shared replay candidate requires local full/SWA, no partial hits or CP")
++            junction = request.shared_prefix_boundary
++            if not 0 <= junction <= request.num_tokens:
++                raise ValueError("Invalid shared prefix junction")
++            if junction:
++                # Use the global EAGLE decision, exactly as for prompt replay:
++                # non-EAGLE groups must retain state at the SAME restart points.
++                boundaries = tuple(sorted(set(boundaries).union(replay_boundaries(
++                    junction, self.scheduler_block_size,
++                    use_eagle=bool(self.eagle_group_ids),
++                ))))
+         for group_id, manager in enumerate(self.single_type_managers):
+             if not manager.enable_caching:
+                 continue
+@@ -375,6 +401,9 @@
+                 retention_interval=self.retention_interval,
+                 replay_boundaries=boundaries,
+             )
++
++        kv_soft_checkpoint.prefill_cached(self, request,
++                                         num_computed_tokens, boundaries)
+ 
+     def emit_cached_block_events(
+         self, request: Request, computed_blocks: tuple[list[KVCacheBlock], ...]
+@@ -406,6 +435,7 @@
+         """
+         for manager in self.single_type_managers:
+             manager.free(request_id)
++        kv_soft_checkpoint.finished(self, request_id, "request_free")
+ 
+     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+         """Pop the request's bookkeeping from all single-type managers and
+@@ -421,6 +451,7 @@
+             The request's blocks in allocation order.
+ 
+         """
++        kv_soft_checkpoint.finished(self, request_id, "request_pop")
+         blocks: list[KVCacheBlock] = []
+         for manager in self.single_type_managers:
+             blocks.extend(manager.pop_blocks_for_free(request_id))
+@@ -928,7 +959,9 @@
+         cache_hit_blocks = tuple(
+             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
+         )
+-        return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
++        result = cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
++        kv_soft_checkpoint.register_result(self, block_hashes, result)
++        return result
+ 
+     def find_longest_cache_hit_per_group(
+         self,
+--- /dev/null
++++ b/vllm/v1/core/kv_soft_checkpoint.py
+@@ -0,0 +1,324 @@
++"""Budgeted eviction preference for verified local Full/SWA checkpoints.
++
++Copied into a private vLLM overlay by the builder. This module never mutates
++KV references, hashes, returned computed blocks, or the total free capacity.
++"""
++from __future__ import annotations
++
++from collections import Counter, OrderedDict
++import json
++import os
++import time
++
++
++class SoftCheckpointQueue:
++    """Two original intrusive queues; ordinary victims precede protected ones."""
++
++    def __init__(self, ordinary, state):
++        self.ordinary = ordinary
++        self.protected = type(ordinary)([])
++        self.state = state
++        self.protected_ids = set()
++
++    @property
++    def num_free_blocks(self):
++        return self.ordinary.num_free_blocks + self.protected.num_free_blocks
++
++    def _queue(self, block):
++        return self.protected if block.block_id in self.protected_ids else self.ordinary
++
++    def remove(self, block):
++        self._queue(block).remove(block)
++        self.protected_ids.discard(block.block_id)
++
++    def popleft(self):
++        return self.popleft_n(1)[0]
++
++    def popleft_n(self, count):
++        assert count <= self.num_free_blocks
++        ordinary_count = min(count, self.ordinary.num_free_blocks)
++        result = self.ordinary.popleft_n(ordinary_count)
++        fallback = self.protected.popleft_n(count - ordinary_count)
++        self.state.metrics["protected_victims"] += len(fallback)
++        for block in fallback:
++            self.protected_ids.remove(block.block_id)
++        return result + fallback
++
++    def append(self, block):
++        self.append_n([block])
++
++    def append_n(self, blocks):
++        ordinary, protected = [], []
++        for block in blocks:
++            if self.state.is_protected(block):
++                protected.append(block)
++                self.protected_ids.add(block.block_id)
++            else:
++                ordinary.append(block)
++        self.ordinary.append_n(ordinary)
++        self.protected.append_n(protected)
++
++    def prepend_n(self, blocks):
++        # Unhashed pages always stay ordinary. A protected cached page follows
++        # the protected queue's FIFO convention even if passed to prepend.
++        ordinary, protected = [], []
++        for block in blocks:
++            if self.state.is_protected(block):
++                protected.append(block)
++                self.protected_ids.add(block.block_id)
++            else:
++                ordinary.append(block)
++        self.ordinary.prepend_n(ordinary)
++        self.protected.append_n(protected)
++
++    def promote(self, block):
++        if block.ref_cnt == 0 and block.block_id not in self.protected_ids:
++            self.ordinary.remove(block)
++            self.protected.append(block)
++            self.protected_ids.add(block.block_id)
++
++    def demote(self, block):
++        if block.block_id in self.protected_ids:
++            self.protected.remove(block)
++            self.protected_ids.remove(block.block_id)
++            self.ordinary.append(block)
++
++    def get_all_free_blocks(self):
++        return (self.ordinary.get_all_free_blocks()
++                + self.protected.get_all_free_blocks())
++
++    def iter_blocks_after(self, cursor):
++        if cursor is not None and cursor.block_id in self.protected_ids:
++            yield from self.protected.iter_blocks_after(cursor)
++        else:
++            yield from self.ordinary.iter_blocks_after(cursor)
++            yield from self.protected.iter_blocks_after(None)
++
++
++class SoftCheckpointState:
++    """Complete bundle LRU, with physical-page sharing and bounded metadata."""
++
++    def __init__(self, pool, budget):
++        if not 0 <= budget < pool.num_gpu_blocks:
++            raise ValueError("Soft checkpoint page budget must exclude the null block")
++        self.pool = pool
++        self.budget = budget
++        self.bundles = OrderedDict()
++        self.owners = {}  # physical ID -> set of complete-bundle identities
++        self.expected = {}  # physical ID -> original primary cache key
++        self.requests = {}  # request ID -> had positive admission / registered
++        self.memberships = 0
++        self.metrics = Counter()
++        self.epoch = 0
++        self.queue = SoftCheckpointQueue(pool.free_block_queue, self)
++        pool.free_block_queue = self.queue
++
++    def is_protected(self, block):
++        return (block.block_id in self.expected
++                and self.expected[block.block_id] == block.block_hash)
++
++    def drop(self, key):
++        blocks = self.bundles.pop(key)
++        self.memberships -= len(blocks)
++        released = []
++        for block in blocks:
++            owners = self.owners[block.block_id]
++            owners.remove(key)
++            if not owners:
++                del self.owners[block.block_id]
++                del self.expected[block.block_id]
++                self.queue.demote(block)
++                released.append(block.block_id)
++        return released
++
++    def invalidate(self, block):
++        # Called before a physical page loses/repoints any cache key. Drop all
++        # affected complete bundles, including shared-page owners.
++        keys = tuple(self.owners.get(block.block_id, ()))
++        self.metrics["invalidated_bundles"] += len(keys)
++        for key in keys:
++            self.drop(key)
++
++    def clear(self):
++        for key in list(self.bundles):
++            self.drop(key)
++        self.requests.clear()
++        self.metrics.clear()
++        self.epoch += 1
++        self.report("cache_reset")
++
++    def report(self, event, request_id=None):
++        # One compact line per completed request/reset, never per block/hash.
++        # This candidate is a mechanism diagnostic; log cost is part of any
++        # measured candidate run and must not be subtracted from its timings.
++        fields = {
++            "event": event, "time_ns": time.time_ns(), "epoch": self.epoch,
++            "request_id": request_id, "budget_pages": self.budget,
++            "bundles": len(self.bundles), "protected_pages": len(self.owners),
++            "memberships": self.memberships,
++            "free_blocks": self.pool.get_num_free_blocks(),
++            **{name: self.metrics[name] for name in (
++                "registered", "refreshed", "protected_victims",
++                "invalidated_bundles", "budget_dropped_bundles",
++                "rejected_invalid", "rejected_oversize",
++                "peak_protected_pages", "peak_memberships")},
++        }
++        if os.environ.get("V4FLASH_DP_CHECKPOINT_RANK_LOG") == "1":
++            import multiprocessing
++            import re
++            process_name = multiprocessing.current_process().name
++            match = re.fullmatch(r"EngineCore_DP(\d+)", process_name)
++            if match is None:
++                raise RuntimeError("Cannot identify checkpoint DP rank: " + process_name)
++            fields.update(dp_rank=int(match[1]), pid=os.getpid())
++        print("V4FLASH_SOFT_CHECKPOINT " + json.dumps(
++            fields, ensure_ascii=True, separators=(",", ":")), flush=True)
++
++    def register(self, key, blocks):
++        unique = {block.block_id: block for block in blocks}
++        blocks = list(unique.values())
++        if not blocks or any(
++                block.is_null or block.pool is not self.pool
++                or block.block_hash is None
++                or self.pool.cached_block_hashes_by_block.get(block.block_id)
++                for block in blocks):
++            self.metrics["rejected_invalid"] += 1
++            return False
++        if len(blocks) > self.budget:
++            self.metrics["rejected_oversize"] += 1
++            return False
++        if key in self.bundles:
++            old = self.bundles[key]
++            if [b.block_id for b in old] == [b.block_id for b in blocks]:
++                self.bundles.move_to_end(key)
++                self.metrics["refreshed"] += 1
++                return True
++            self.drop(key)
++        for block in blocks:
++            if (block.block_id in self.expected
++                    and self.expected[block.block_id] != block.block_hash):
++                self.invalidate(block)
++        fresh = sum(block.block_id not in self.owners for block in blocks)
++        # Sharing cannot create unbounded overlapping-bundle metadata. Keep
++        # total physical-page memberships <= twice the distinct-page budget.
++        while self.bundles and (
++                len(self.owners) + fresh > self.budget
++                or self.memberships + len(blocks) > 2 * self.budget):
++            released = self.drop(next(iter(self.bundles)))
++            self.metrics["budget_dropped_bundles"] += 1
++            fresh += sum(block_id in unique for block_id in released)
++        if len(self.owners) + fresh > self.budget:
++            raise AssertionError("Complete-bundle page accounting drift")
++        self.bundles[key] = blocks
++        self.memberships += len(blocks)
++        for block in blocks:
++            self.owners.setdefault(block.block_id, set()).add(key)
++            self.expected[block.block_id] = block.block_hash
++            self.queue.promote(block)
++        self.metrics["registered"] += 1
++        self.metrics["peak_protected_pages"] = max(
++            self.metrics["peak_protected_pages"], len(self.owners))
++        self.metrics["peak_memberships"] = max(
++            self.metrics["peak_memberships"], self.memberships)
++        return True
++
++
++def install(pool):
++    if os.environ.get("V4FLASH_KV_SOFT_CHECKPOINT") != "1":
++        return
++    if not pool.enable_caching:
++        raise ValueError("Soft checkpoints require prefix caching")
++    # Explicit launch snapshot, never a hardcoded hardware/model constant.
++    budget = int(os.environ["V4FLASH_KV_SOFT_CHECKPOINT_PAGES"])
++    pool._soft_checkpoint = SoftCheckpointState(pool, budget)
++
++
++def state_for(coordinator):
++    managers = coordinator.single_type_managers
++    if not managers:
++        return None
++    state = getattr(managers[0].block_pool, "_soft_checkpoint", None)
++    if state is None:
++        return None
++    if (getattr(coordinator, "enable_partial_hash_hits", False)
++            or any(type(manager).__name__ not in (
++                "FullAttentionManager", "SlidingWindowManager")
++                   or manager.dcp_world_size != 1 or manager.pcp_world_size != 1
++                   or manager.block_pool is not state.pool
++                   for manager in managers)):
++        raise RuntimeError("Soft checkpoint candidate requires one local Full/SWA pool, no partial hits or CP")
++    return state
++
++
++def register_result(coordinator, block_hashes, result):
++    """Re-verify exact local proof and register the original successful hit."""
++    state = state_for(coordinator)
++    if state is None or result[1] == 0:
++        return False
++    hit_blocks, hit, _ = result
++    pool = state.pool
++    selected, identity = {}, []
++    for manager, adopted in zip(coordinator.single_type_managers, hit_blocks):
++        group = manager.kv_cache_group_id
++        if type(manager).__name__ == "FullAttentionManager":
++            need = hit // manager.block_size
++            if len(adopted) != need or any(block.is_null for block in adopted):
++                return False
++            group_blocks = list(adopted)
++        else:
++            size = manager.block_size
++            if hit % size:
++                return False
++            need = type(manager)._contiguous_blocks_for_hit(
++                manager.kv_cache_spec.sliding_window, size, manager.use_eagle)
++            last = hit + (size if manager.use_eagle else 0)
++            group_blocks = []
++            for end in range(last - (need - 1) * size, last + 1, size):
++                if end <= 0 or end % pool.hash_block_size:
++                    return False
++                cached = pool.get_cached_block(
++                    block_hashes[end // pool.hash_block_size - 1], [group])
++                if cached is None:
++                    return False
++                group_blocks.append(cached[0])
++        if not group_blocks:
++            return False
++        identity.append((group, group_blocks[-1].block_hash))
++        for block in group_blocks:
++            selected[block.block_id] = block
++    return state.register((hit, tuple(identity)), list(selected.values()))
++
++
++def admitted(coordinator, request_id, local_tokens, external_tokens):
++    state = state_for(coordinator)
++    if state is not None:
++        if external_tokens:
++            raise RuntimeError("Soft checkpoint candidate excludes external KV loads")
++        state.requests[request_id] = local_tokens > 0
++
++
++def finished(coordinator, request_id, event):
++    state = state_for(coordinator)
++    if state is not None:
++        state.requests.pop(request_id, None)
++        state.report(event, request_id)
++
++
++def prefill_cached(coordinator, request, computed, boundaries):
++    """Register one conservative complete checkpoint on cold prefill finish.
++
++    A positive admission already registered its actual shared hit; replacing it
++    with a unique continuation checkpoint would consume the budget pointlessly.
++    """
++    state = state_for(coordinator)
++    if (state is None or computed < request.num_prompt_tokens
++            or state.requests.get(request.request_id, False)):
++        return
++    state.requests[request.request_id] = True
++    candidates = [boundary for boundary in boundaries if boundary > 0]
++    if not candidates:
++        return
++    recovery = min(candidates)
++    # This call uses the unchanged fixed-point finder. Its post-query hook
++    # registers only a fully verified result, possibly at a lower boundary.
++    coordinator.find_longest_cache_hit(request.block_hashes, recovery)
+--- /dev/null
++++ b/vllm/v1/worker/gpu/dp4_r6.py
+@@ -0,0 +1,152 @@
++"""Observe the opt-in, coordinated DP4 extension of the R6 executor."""
++
++from __future__ import annotations
++
++import atexit
++import json
++import os
++from pathlib import Path
++import signal
++import time
++
++
++COUNTERS = (
++    "total_steps", "total_tokens", "eligible_steps", "requested_splits",
++    "actual_splits", "split_tokens", "completed_splits", "completed_split_tokens",
++    "fallback_steps", "single_steps",
++)
++ROUTES = ("single", "dp4-coordinated-r6")
++_PROBE = None
++
++
++def compatible_topology(config):
++    """Fail closed: this extension keeps the DP handshake and EP disabled."""
++    return (
++        config is not None
++        and config.tensor_parallel_size == 1
++        and config.data_parallel_size == 4
++        and config.decode_context_parallel_size == 1
++        and config.prefill_context_parallel_size == 1
++        and config.pipeline_parallel_size == 1
++        and not config.enable_expert_parallel
++        and not config.use_ubatching
++    )
++
++
++def dp4_r6_thresholds(config, num_tokens, uniform_decode, fallback):
++    """Replace only the threshold decision inside the existing DP agreement."""
++    if os.environ.get("V4FLASH_DP4_R6_ENABLE", "0") != "1":
++        return fallback(config, num_tokens, uniform_decode=uniform_decode)
++    if not compatible_topology(config):
++        raise ValueError("DP4 R6 requires TP1/DP4/DCP1/PCP1/PP1, EP=0 and DBO off")
++    if os.environ.get("V4FLASH_AR_DUAL", "0") != "1":
++        return fallback(config, num_tokens, uniform_decode=uniform_decode)
++    if os.environ.get("V4FLASH_AR_DUAL_PURE_PREFILL", "0") != "0":
++        raise ValueError("DP4 R6 supports the original R6 gate, not R6a")
++    threshold = int(os.environ.get("V4FLASH_AR_DUAL_MIN_TOKENS", "4096"))
++    if threshold < 256:
++        raise ValueError("DP4 R6 threshold must permit two 128-token aligned slices")
++    return num_tokens >= threshold
++
++
++def _process_identity():
++    fields = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()
++    return dict(pid=os.getpid(), pgid=os.getpgrp(), start_ticks=fields[19])
++
++
++class GateProbe:
++    """CPU counters; records are flushed at phase boundaries, never per step."""
++
++    def __init__(self, directory, dp_rank):
++        if type(dp_rank) is not int or not 0 <= dp_rank < 4:
++            raise ValueError("DP4 gate needs an explicit rank in 0..3")
++        self.directory = Path(directory)
++        self.directory.mkdir(parents=True, exist_ok=True)
++        self.path = self.directory / f"rank-{dp_rank}.jsonl"
++        self.identity = _process_identity()
++        self.dp_rank = dp_rank
++        self.counters = dict.fromkeys(COUNTERS, 0)
++        self.route_counts = dict.fromkeys(ROUTES, 0)
++        self.num_tokens_histogram = {}
++        self.padded_tokens_histogram = {}
++        self.last_step = None
++        with self.path.open("x"):
++            pass
++
++    def flush(self, reason):
++        record = dict(
++            schema="dp4-r6-gate-v1", **self.identity,
++            dp_rank=self.dp_rank, time_ns=time.time_ns(), reason=reason,
++            counters=dict(self.counters), route_counts=dict(self.route_counts),
++            num_tokens_histogram=dict(self.num_tokens_histogram),
++            padded_tokens_histogram=dict(self.padded_tokens_histogram),
++            last_step=self.last_step,
++            dual=os.environ.get("V4FLASH_AR_DUAL", "0"),
++            extension=os.environ.get("V4FLASH_DP4_R6_ENABLE", "0"),
++            min_tokens=int(os.environ.get("V4FLASH_AR_DUAL_MIN_TOKENS", "4096")),
++            decision="existing DP handshake; every rank allows; minimum rank meets threshold",
++        )
++        with self.path.open("a", encoding="utf-8") as stream:
++            stream.write(json.dumps(record, sort_keys=True) + "\n")
++            stream.flush()
++        return record
++
++    def record(self, num_tokens, padded_tokens, requested, actual, dummy=False):
++        if dummy:
++            return
++        if min(num_tokens, padded_tokens) < 0 or padded_tokens < num_tokens:
++            raise ValueError("Gate token counts are invalid")
++        threshold = int(os.environ.get("V4FLASH_AR_DUAL_MIN_TOKENS", "4096"))
++        route = ROUTES[int(bool(actual))]
++        self.counters["total_steps"] += 1
++        self.counters["total_tokens"] += num_tokens
++        self.counters["eligible_steps"] += int(num_tokens >= threshold)
++        self.counters["requested_splits"] += int(bool(requested))
++        self.counters["actual_splits"] += int(bool(actual))
++        self.counters["split_tokens"] += num_tokens if actual else 0
++        self.counters["fallback_steps"] += int(bool(requested) and not actual)
++        self.counters["single_steps"] += int(not actual)
++        self.route_counts[route] += 1
++        for mapping, value in (
++            (self.num_tokens_histogram, num_tokens),
++            (self.padded_tokens_histogram, padded_tokens),
++        ):
++            key = str(value)
++            mapping[key] = mapping.get(key, 0) + 1
++        self.last_step = dict(
++            num_tokens=num_tokens, padded_tokens=padded_tokens,
++            requested_split=bool(requested), actual_split=bool(actual), route=route,
++        )
++
++    def completed(self, num_tokens):
++        if self.last_step is None or not self.last_step["actual_split"]:
++            raise RuntimeError("Cannot complete a split that was not dispatched")
++        if self.last_step["num_tokens"] != num_tokens:
++            raise RuntimeError("Completed split uses a different scheduler token count")
++        self.counters["completed_splits"] += 1
++        self.counters["completed_split_tokens"] += num_tokens
++
++
++def record_step(dp_rank, num_tokens, padded_tokens, requested, actual, dummy=False):
++    global _PROBE
++    directory = os.environ.get("V4FLASH_DP4_R6_PROBE_DIR")
++    if not directory or dummy:
++        return
++    if _PROBE is None:
++        if signal.getsignal(signal.SIGUSR2) != signal.SIG_DFL:
++            raise RuntimeError("DP4 R6 refuses to replace an existing SIGUSR2 handler")
++        _PROBE = GateProbe(directory, dp_rank)
++        signal.signal(signal.SIGUSR2, lambda *_: _PROBE.flush("SIGUSR2"))
++        atexit.register(_PROBE.flush, "atexit")
++        _PROBE.flush("registered")
++    if _PROBE.dp_rank != dp_rank:
++        raise RuntimeError("A gate process cannot change its DP rank")
++    _PROBE.record(num_tokens, padded_tokens, requested, actual)
++
++
++def record_completed_split(dp_rank, num_tokens):
++    if not os.environ.get("V4FLASH_DP4_R6_PROBE_DIR"):
++        return
++    if _PROBE is None or _PROBE.dp_rank != dp_rank:
++        raise RuntimeError("Split completion has no matching rank gate")
++    _PROBE.completed(num_tokens)
+--- a/vllm/v1/worker/gpu/dp_utils.py
++++ b/vllm/v1/worker/gpu/dp_utils.py
+@@ -3,6 +3,8 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, replace
++
++import os
+ 
+ import torch
+ import torch.distributed as dist
+@@ -16,6 +18,8 @@
+     CudaGraphManager,
+ )
+ from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
++from vllm.v1.worker.workspace import ar_dual_enabled
++from vllm.v1.worker.gpu.dp4_r6 import dp4_r6_thresholds
+ 
+ 
+ @dataclass(frozen=True)
+@@ -104,12 +108,13 @@
+         uniform_decode_across_dp = uniform_decode and torch.all(
+             uniform_token_counts_across_dp == (uniform_token_count or 0)
+         )
+-        if check_ubatch_thresholds(
++        if dp4_r6_thresholds(
+             parallel_config,
+             # Thresholds only grow with the token count, so holding the smallest
+             # rank to them holds every rank to them.
+             int(num_tokens_across_dp.min()),
+             uniform_decode=uniform_decode_across_dp,
++            fallback=check_ubatch_thresholds,
+         ):
+             # Expert all-to-all requires every rank to split and pad equally.
+             # Empty microbatches run as dummy batches.
+@@ -288,6 +293,40 @@
+         )
+ 
+     if dp_size == 1:
++        # A1 第二刀（TP-only 双 chunk）：DP=1 时上游在这里早退，`batch_desc.num_ubatches`
++        # 恒为 1 ⇒ 即便 UBatchRunner 已建出来，V2 消费端（gpu/model_runner.py 的
++        # `if batch_desc.num_ubatches > 1`）也永远不会调用它（"建出来 ≠ 跑起来"）。
++        # dual 打开时在此重新派发一个 num_ubatches=2 的 descriptor。
++        # A1：**只在 prefill 切分**。decode 的 token 数远小于该阈值 ⇒ 走单批，
++        # 保留原有 FULL CUDA graph（捕获时是 num_ubatches=1，切了反而匹配不到图而退化成 eager）。
++        _dual_min_tokens = int(os.environ.get("V4FLASH_AR_DUAL_MIN_TOKENS", "4096"))
++        if ar_dual_enabled() and num_tokens >= _dual_min_tokens:
++            num_ubatches = 2
++            ubatch_desc = None
++            # 守卫 1：profile run 时 cudagraph_manager 为 None（此时 need_eager 必为 True）
++            if not (need_eager or reuse_eager) and cudagraph_manager is not None:
++                ubatch_desc = cudagraph_manager.dispatch(
++                    num_reqs,
++                    num_tokens,
++                    dp_sync_state.uniform_token_count
++                    if dp_sync_state
++                    else uniform_token_count,
++                    num_active_loras=num_active_loras,
++                    max_query_len=max_query_len,
++                    num_ubatches=num_ubatches,
++                )
++                # 守卫 2：第二个 chunk 会为空（2*num_tokens < 图的 token 数）⇒ 退回单批
++                if 2 * num_tokens < ubatch_desc.num_tokens:
++                    ubatch_desc = None
++            if ubatch_desc is None:
++                ubatch_desc = BatchExecutionDescriptor(
++                    cg_mode=CUDAGraphMode.NONE,
++                    num_tokens=num_tokens,
++                    num_reqs=num_reqs,
++                    num_active_loras=num_active_loras,
++                    num_ubatches=num_ubatches,
++                )
++            return ubatch_desc, None
+         return batch_desc, None
+ 
+     if dp_sync_state is not None:
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -16,11 +16,13 @@
+ instead of embedding feature-specific logic directly.
+ """
+ 
++from vllm.v1.worker.gpu.dp4_r6 import record_step, record_completed_split
++
+ import functools
+ import gc
+ import time
+ from collections.abc import Iterable
+-from contextlib import AbstractContextManager
++from contextlib import AbstractContextManager, nullcontext
+ from copy import deepcopy
+ from dataclasses import replace
+ from typing import Any, NamedTuple
+@@ -185,9 +187,17 @@
+     copy_kv_cache_blocks_inplace,
+     get_uniform_decode_token_count,
+ )
+-from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
++from vllm.v1.worker.workspace import (
++    ar_debug_enabled,
++    ar_lane_count,
++    lock_workspace,
++    use_workspace_lane,
++)
+ 
+ logger = init_logger(__name__)
++
++# A1（2026-11-01）：降级计数，用来区分“启动期正常降级”与“真实请求期异常降级”。
++_A1_DEGRADE_COUNTS = {"startup": 0, "request": 0}
+ 
+ 
+ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1797,6 +1807,8 @@
+             uniform_decode=uniform_tok_count == self.decode_query_len,
+         )
+ 
++        _dp4_r6_requested_split = batch_desc.num_ubatches > 1
++
+         if batch_desc.num_tokens == 0:
+             # All DP ranks have zero tokens to run.
+             empty_output = self.kv_connector.no_forward(scheduler_output)
+@@ -1886,6 +1898,43 @@
+         attn_metadata = None
+         slot_mappings_by_layer = None
+         ubatch_state: UBatchState | None = None
++        # A1 第四刀：**消费端兜底**。`self.ubatch_runner` 在 `initialize_kv_cache()` 里才构建
++        # （`gpu/model_runner.py:712`），而内存 profiling 的 dummy run 发生在它**之前**
++        # ⇒ 那时 `num_ubatches > 1` 但 runner 还是 None，直接撞下面的 assert。
++        # 这里只在"runner 未就绪"时降级为单批；**有 runner 就必须真跑**，不做无条件降级。
++        if batch_desc.num_ubatches > 1 and (
++            # A1 a10（2026-11-01）：warmup / dummy run 恒单批。
++            # 双 lane 在 warmup 阶段会用未就绪的 lane 状态启动 kernel，实测会把 GPU 侧挂住，
++            # 之后每次 cubin 加载（triton _init_handles）都在等这个已损坏的上下文里空转。
++            # dual 只在真实请求期生效，warmup 全程走单批。
++            dummy_run
++            or self.ubatch_runner is None
++            or block_tables is None
++            or slot_mappings is None
++        ):
++            # 三种情形都必须退回单批：runner 未就绪（profile/dummy run），
++            # 或这条 warmup 路径根本不构建 attn 元数据（flashinfer autotune 的 dummy run）。
++            # 真实请求期这三个对象必然存在，故本降级不会掩盖真实的 dual 失败。
++            _why = (
++                "warmup"
++                if dummy_run
++                else (
++                    "runner_none"
++                    if self.ubatch_runner is None
++                    else ("no_block_tables" if block_tables is None else "no_slot_mappings")
++                )
++            )
++            _phase = "startup" if dummy_run else "request"
++            _A1_DEGRADE_COUNTS[_phase] += 1
++            logger.warning_once(
++                "[A1 DEGRADE] reason=%s num_tokens=%d cg_mode=%s",
++                _why, batch_desc.num_tokens, batch_desc.cg_mode,
++            )
++            logger.info(
++                "[A1 DEGRADE-SUM] startup=%d request=%d (last reason=%s)",
++                _A1_DEGRADE_COUNTS["startup"], _A1_DEGRADE_COUNTS["request"], _why,
++            )
++            batch_desc = replace(batch_desc, num_ubatches=1)
+         if batch_desc.num_ubatches > 1:
+             assert self.ubatch_runner is not None
+             assert block_tables is not None and slot_mappings is not None
+@@ -1989,6 +2038,11 @@
+             self.model_config, input_batch.num_tokens, ubatch_slices
+         )
+ 
++        record_step(
++            self.dp_rank, int(num_toks), int(input_batch.num_tokens_after_padding),
++            _dp4_r6_requested_split, ubatch_state is not None, dummy=dummy_run,
++        )
++
+         self.step_timing.record_batch(
+             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
+         )
+@@ -2026,22 +2080,47 @@
+                 is_padding=input_batch.is_padding,
+             ):
+                 self.kv_connector.pre_forward(scheduler_output, input_batch)
++                # A1（自研双 lane）：让相邻两次 forward 落在 workspace 的不同 slot 上。
++                # **本刀只做顺序执行**（不开第二条流），目的仅两件事：
++                #   ① 证明两条 lane 的 scratch 指针确实不同；② 证明换 lane 不影响数值。
++                # ⚠ lane 的选择用"**只在被钩住的分支里自增**的计数器"，不是"每次 forward 都自增"：
++                #   本函数是三分支（FULL / PIECEWISE / eager），我们的 prefill 只走后两条；
++                #   若 decode 走 FULL 不进 here，全局自增会让"以为在 lane 1、实际还在 lane 0"脱节。
++                #   只在钩住的分支里推进 ⇒ 计数器与实际发生的 lane 切换始终一致。
++                def _ar_lane_ctx():
++                    lanes = ar_lane_count()
++                    if lanes <= 1:
++                        return nullcontext()
++                    n = getattr(self, "_ar_lane_hooked_calls", 0)
++                    self._ar_lane_hooked_calls = n + 1
++                    lane = n % lanes
++                    if ar_debug_enabled() and n < 4:
++                        logger.info(
++                            "[A1 FORWARD] hooked_call=%d lane=%d cg=%s",
++                            n, lane, batch_desc.cg_mode,
++                        )
++                    return use_workspace_lane(lane)
++
+                 if ubatch_state is not None:
+                     assert self.ubatch_runner is not None
+                     model_output = self.ubatch_runner.run(
+                         self.model, model_inputs, ubatch_state
+                     )
++                    if not dummy_run:
++                        record_completed_split(self.dp_rank, int(num_toks))
+                 elif batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                     # Run the PIECEWISE graph (compiled PW cudagraph or breakable
+                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
+                     # PIECEWISE after the cudagraph manager exists.
+                     assert self.cudagraph_manager is not None
+-                    model_output = self.cudagraph_manager.run_pw_graph(
+-                        self.model, model_inputs
+-                    )
++                    with _ar_lane_ctx():
++                        model_output = self.cudagraph_manager.run_pw_graph(
++                            self.model, model_inputs
++                        )
+                 else:
+                     # Eager (NONE): call the raw model directly.
+-                    model_output = self.model(**model_inputs)
++                    with _ar_lane_ctx():
++                        model_output = self.model(**model_inputs)
+ 
+         self.kv_connector.finish_forward()
+ 
+--- a/vllm/v1/worker/gpu/ubatch_utils.py
++++ b/vllm/v1/worker/gpu/ubatch_utils.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Microbatching (DBO) helpers for the V2 GPU model runner."""
+ 
++import json
++import os
+ import threading
+ from collections.abc import Callable
+ from contextlib import ExitStack
+@@ -27,13 +29,14 @@
+ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+ from vllm.v1.worker.gpu.input_batch import InputBatch
+ from vllm.v1.worker.gpu.model_states.interface import ModelState
++from vllm.v1.worker.workspace import ar_debug_enabled, ar_dual_enabled
+ from vllm.v1.worker.ubatch_utils import (
+     UBatchSlice,
+     UBatchSlices,
+     create_sm_control_context,
+     maybe_create_ubatch_slices,
+ )
+-from vllm.v1.worker.ubatching import make_ubatch_contexts
++from vllm.v1.worker.ubatching import make_ar_lane_contexts, make_ubatch_contexts
+ from vllm.v1.worker.utils import AttentionGroup
+ 
+ logger = init_logger(__name__)
+@@ -61,6 +64,12 @@
+         input_batch.num_tokens_after_padding,
+         input_batch.num_reqs_after_padding,
+         num_ubatches,
++        # CuTeDSL compressor requires 64-byte-aligned positions (int64).
++        # Align to 128 tokens, also preserving quantization-block boundaries.
++        split_point=(
++            (int(input_batch.num_tokens_after_padding) // num_ubatches // 128) * 128
++            if ar_dual_enabled() else None
++        ),
+     )
+     assert ubatch_slices is not None
+     return [
+@@ -279,6 +288,28 @@
+     return torch.cat(outputs, dim=0)
+ 
+ 
++def recovery_output_tensors(value):
++    if isinstance(value, torch.Tensor):
++        yield value
++    elif isinstance(value, (tuple, list)):
++        for part in value:
++            yield from recovery_output_tensors(part)
++    else:
++        raise TypeError(f"Unsupported recovery output: {type(value)}")
++
++
++def merge_recovery_outputs(outputs):
++    first = outputs[0]
++    assert all(type(x) is type(first) for x in outputs)
++    if isinstance(first, torch.Tensor):
++        assert all(x.shape[1:] == first.shape[1:] and x.dtype == first.dtype and x.device == first.device for x in outputs)
++        return torch.cat(outputs, dim=0)
++    if isinstance(first, (tuple, list)):
++        assert all(len(x) == len(first) for x in outputs)
++        return type(first)(merge_recovery_outputs([x[i] for x in outputs]) for i in range(len(first)))
++    raise TypeError(f"Unsupported recovery output: {type(first)}")
++
++
+ class UBatchRunner:
+     """Runs the model on two or more microbatches that overlap each other.
+ 
+@@ -299,7 +330,10 @@
+     ):
+         self.vllm_config = vllm_config
+         self.parallel_config = vllm_config.parallel_config
+-        self.num_ubatches = self.parallel_config.num_ubatches
++        # A1：dual 打开时固定 2 个 chunk（不依赖 enable_dbo / ubatch_size）。
++        self.num_ubatches = (
++            2 if ar_dual_enabled() else self.parallel_config.num_ubatches
++        )
+         self.dcp_size = self.parallel_config.decode_context_parallel_size
+         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+         self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
+@@ -348,6 +382,13 @@
+         FULL uses padded sizes; `for_capture` refreshes metadata from dummy
+         block tables.
+         """
++        # A1 第六层信号：**进入 dual 路径**（与"完整跑完一个 step"的 `[A1 KEYS]` 分开记）。
++        # 这条出现而 `[A1 KEYS]` 不出现 ⇒ 说明 prepare 之后崩了（这轮就是这么定位的）。
++        logger.info_once(
++            "[A1 PREPARE] entering ubatch prepare: num_ubatches=%d cg_mode=%s",
++            self.num_ubatches,
++            cg_mode,
++        )
+         ubatch_slices = create_ubatch_slices(input_batch, self.num_ubatches)
+ 
+         attn_metadata = []
+@@ -416,8 +457,14 @@
+                 create_forward_context(
+                     attn_metadata[i],
+                     self.vllm_config,
+-                    dp_metadata=DPMetadata.make(
+-                        self.parallel_config, num_tokens, num_tokens_across_dp
++                    # A1（2026-11-01）：DP=1 时不存在跨 DP 协调，而 DPMetadata.make
++                    # 自身断言 data_parallel_size > 1，因此每片 forward context 不携带 DP 元数据。
++                    dp_metadata=(
++                        DPMetadata.make(
++                            self.parallel_config, num_tokens, num_tokens_across_dp
++                        )
++                        if self.parallel_config.data_parallel_size > 1
++                        else None
+                     ),
+                     cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                     slot_mapping=slot_mappings_by_layer[i],
+@@ -456,13 +503,101 @@
+         assert len(ubatch_slices) == self.num_ubatches
+ 
+         compute_stream = self.capture_stream if for_capture else current_stream()
+-        ubatch_contexts = make_ubatch_contexts(
+-            num_micro_batches=self.num_ubatches,
+-            comm_stream=self.comm_stream,
+-            compute_stream=compute_stream,
+-            forward_contexts=ubatch_state.forward_contexts,
+-            ready_barrier=self.ready_barrier,
+-        )
++        if ar_dual_enabled():
++            # A1：lane 上下文 —— 不注册 _THREAD_ID_TO_CONTEXT（dbo_enabled() 恒 False）、
++            # 不做交接（两 chunk 真并发）、chunk i 固定 lane i（CUDA graph 要求静态映射）。
++            ubatch_contexts = make_ar_lane_contexts(
++                num_micro_batches=self.num_ubatches,
++                compute_stream=compute_stream,
++                forward_contexts=ubatch_state.forward_contexts,
++                ready_barrier=self.ready_barrier,
++            )
++        else:
++            ubatch_contexts = make_ubatch_contexts(
++                num_micro_batches=self.num_ubatches,
++                comm_stream=self.comm_stream,
++                compute_stream=compute_stream,
++                forward_contexts=ubatch_state.forward_contexts,
++                ready_barrier=self.ready_barrier,
++            )
++
++        schedule = os.environ.get("V4FLASH_AR_SCHEDULE", "")
++        if ar_dual_enabled() and schedule in ("interleaved", "overlap"):
++            assert not for_capture, "recovery microbatch execution is eager"
++            from vllm.v1.worker.workspace import use_workspace_lane
++            inner = getattr(model, "model", None)
++            assert inner is not None and hasattr(inner, "forward_recovery_generator")
++            assert not inner.use_sequence_parallel
++            overlap = schedule == "overlap"
++            if overlap:
++                if not hasattr(self, "_recovery_streams"):
++                    self._recovery_streams = [torch.cuda.Stream(device=compute_stream.device) for _ in ubatch_slices]
++                streams = self._recovery_streams
++                for stream in streams:
++                    stream.wait_stream(compute_stream)
++            else:
++                streams = [compute_stream] * len(ubatch_slices)
++            generators = []
++            for ctx, ub_slice in zip(ubatch_state.forward_contexts, ubatch_slices):
++                ctx.additional_kwargs["recovery_overlap"] = overlap
++                ctx.additional_kwargs["recovery_token_offset"] = ub_slice.token_slice.start
++                inputs = slice_model_inputs(model_inputs, ub_slice.token_slice)
++                inputs.setdefault("intermediate_tensors", None)
++                generators.append(inner.forward_recovery_generator(**inputs))
++            completed = {}
++            layers = [0] * len(generators)
++            with torch.inference_mode():
++                while len(completed) < len(generators):
++                    round_layers = []
++                    for lane, gen in enumerate(generators):
++                        if lane in completed:
++                            continue
++                        ctx = ubatch_state.forward_contexts[lane]
++                        with override_forward_context(ctx), use_workspace_lane(lane), torch.cuda.stream(streams[lane]):
++                            try:
++                                layer_id = next(gen)
++                                layers[lane] += 1
++                                round_layers.append(layer_id)
++                            except StopIteration as result:
++                                tensors = list(recovery_output_tensors(result.value))
++                                assert tensors and all(t.shape[0] == ubatch_slices[lane].num_tokens for t in tensors)
++                                completed[lane] = result.value
++                    assert len(set(round_layers)) <= 1, "microbatch layer order diverged"
++            # Side-stream results are consumed by merge/sampling on the parent.
++            for lane, stream in enumerate(streams):
++                if overlap:
++                    compute_stream.wait_stream(stream)
++                    for tensor in recovery_output_tensors(completed[lane]):
++                        tensor.record_stream(compute_stream)
++            if os.environ.get("V4FLASH_RECOVERY_SYNC", "1") == "1":
++                compute_stream.synchronize()
++                logger.info("[RECOVERY GPU DONE] schedule=%s layers=%s tokens=%s", schedule, layers, [s.num_tokens for s in ubatch_slices])
++            def finish_recovery():
++                self._pending_finish = None
++                return merge_recovery_outputs([completed[i] for i in range(len(generators))])
++            self._pending_finish = finish_recovery
++            return finish_recovery
++
++        # Recovery diagnostic: original kernels, one caller thread/stream.
++        # No concurrent forward-context writes or collective reordering.
++        if ar_dual_enabled() and os.environ.get("V4FLASH_AR_SCHEDULE") == "serial":
++            assert not for_capture, "serial split diagnostic excludes graph capture"
++            from vllm.v1.worker.workspace import use_workspace_lane
++            outputs_serial = []
++            with torch.inference_mode(), torch.cuda.stream(compute_stream):
++                for lane, (ctx, ub_slice) in enumerate(zip(
++                    ubatch_state.forward_contexts, ubatch_slices
++                )):
++                    logger.info("[RECOVERY SERIAL BEGIN] lane=%s slice=%s", lane, ub_slice.token_slice)
++                    with override_forward_context(ctx), use_workspace_lane(lane):
++                        outputs_serial.append(model(**slice_model_inputs(model_inputs, ub_slice.token_slice)))
++                    compute_stream.synchronize()
++                    logger.info("[RECOVERY SERIAL GPU DONE] lane=%s", lane)
++            def finish_serial():
++                self._pending_finish = None
++                return merge_ubatch_outputs(outputs_serial)
++            self._pending_finish = finish_serial
++            return finish_serial
+ 
+         outputs: dict[int, Any] = {}
+         errors: dict[int, BaseException] = {}
+@@ -526,6 +661,42 @@
+                 ) from errors[failed]
+             return merge_ubatch_outputs([outputs[i] for i in range(self.num_ubatches)])
+ 
++        if ar_debug_enabled():
++            # 两 lane 的 workspace 必须对称：**测量前**就把两侧的 key 集合与字节数打成一行 JSON，
++            # 这样万一不等，日志里能直接看出是哪一侧多了什么（只抛 assert 不够用）。
++            from vllm.v1.worker.workspace import current_workspace_manager
++
++            snap = current_workspace_manager().ar_snapshot()
++            informative = [item for item in snap if item["key_count"] or item["scratch_bytes"]]
++            # 只比 **scratch** 那一路的尺寸是否一致；persistent key 允许一侧多出小对象
++            # （2026-11-01 实测：A1 交替跑时 lane1 多 4×0.87 MB，形态固定、不随负载增长）。
++            # `V4FLASH_AR_KEYS_STRICT=1` 时要求 key 集合完全相等（用于 a2 双 chunk 对称场景）。
++            strict = os.environ.get("V4FLASH_AR_KEYS_STRICT", "0") == "1"
++            if strict:
++                key_sets = {frozenset(item["keys"]) for item in informative}
++                symmetric = len(key_sets) <= 1
++            else:
++                scratch_sizes = {item["scratch_bytes"] for item in informative}
++                symmetric = len(scratch_sizes) <= 1
++            logger.info("[A1 KEYS] asymmetric=%s strict=%s %s",
++                        (not symmetric), strict, json.dumps(informative, ensure_ascii=False))
++            if not symmetric:
++                union = set().union(*(set(i["keys"]) for i in informative))
++                diffs = {
++                    str(item["lane"]): sorted(union - set(item["keys"]))
++                    for item in informative
++                }
++                logger.error(
++                    "[A1 KEYS] asymmetric (strict=%s), missing-per-lane=%s", strict, diffs
++                )
++            # A1（2026-11-01）：启动期 warmup 的 dual 执行里，lane1 的 workspace 还是
++            # "惰性未分配"状态（实测 lane0 387.7 MB vs lane1 0.9 MB），这是正常热身态，
++            # 不是不对称缺陷。因此断言默认关闭、但每次仍打印 `[A1 KEYS]` 供人工判定；
++            # 需要严格闸时设 V4FLASH_AR_KEYS_ASSERT=1。
++            if os.environ.get("V4FLASH_AR_KEYS_ASSERT", "0") == "1":
++                assert symmetric, "两 lane 的 workspace key 集合不同 ⇒ 显存/性能不对称"
++
++
+         self._pending_finish = finish
+         return finish
+ 
+@@ -555,10 +726,19 @@
+     available with more than one DP rank (as in the V1 runner).
+     """
+     parallel_config = vllm_config.parallel_config
+-    if not parallel_config.use_ubatching or parallel_config.data_parallel_size <= 1:
++    # A1 第二刀：TP-only（DP=1）也允许建 runner。DP 前置条件在此被显式绕过，
++    # 但**不引入 DBO 语义**：上下文用 ARLaneContext（不注册线程 id ⇒ dbo_enabled() 恒 False），
++    # scratch 隔离走 workspace lane。
++    dual = ar_dual_enabled()
++    if not dual and (
++        not parallel_config.use_ubatching or parallel_config.data_parallel_size <= 1
++    ):
+         return None
+ 
+-    logger.info_once("Dual batch overlap is enabled.")
++    logger.info_once(
++        "A1 dual-chunk (TP-only) is enabled." if dual
++        else "Dual batch overlap is enabled."
++    )
+     return UBatchRunner(
+         vllm_config, device, model_state, attn_groups, kv_cache_config, max_num_reqs
+     )
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -104,7 +104,7 @@
+     maybe_save_startup_plan,
+ )
+ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
+-from vllm.v1.worker.workspace import init_workspace_manager
++from vllm.v1.worker.workspace import ar_lane_count, init_workspace_manager
+ 
+ from ...model_executor.model_loader import TensorizerLoader
+ from .gpu.cudagraph_utils import has_compiled_submodule
+@@ -116,11 +116,15 @@
+ 
+ def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
+     spec_config = vllm_config.speculative_config
+-    return (
++    upstream = (
+         2
+         if use_v2_model_runner and spec_config is not None and spec_config.use_dspark()
+         else 1
+     )
++    # A1（自研双 lane）：V4FLASH_AR_LANES=2 时把 workspace lane 维提到 2，
++    # 让目标模型的相邻两次 forward 落在不同 lane 上（b12x 的 workspace2 由此物理隔离）。
++    # 未设该环境变量时 ar_lane_count() 返回 1，本函数行为与 stock 完全一致。
++    return max(upstream, ar_lane_count())
+ 
+ 
+ def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int | None:
+@@ -555,6 +559,13 @@
+             # Scratch holds no state across steps: discard it on sleep.
+             alloc_context=lambda: self._maybe_get_memory_pool_context("workspace"),
+         )
++        if ar_lane_count() > 1:
++            import logging as _logging
++            _logging.getLogger(__name__).info(
++                "[A1 LANES-INIT] workspace lanes=%d (V4FLASH_AR_LANES=%s)",
++                _num_workspace_lanes(self.vllm_config, self.use_v2_model_runner),
++                os.environ.get("V4FLASH_AR_LANES"),
++            )
+         self.model_runner: GPUModelRunner = self._make_model_runner()
+         if self.rank == 0:
+             # If usage stat is enabled, collect relevant info.
+--- a/vllm/v1/worker/ubatch_utils.py
++++ b/vllm/v1/worker/ubatch_utils.py
+@@ -134,6 +134,12 @@
+ 
+ def get_num_ubatches(parallel_config: ParallelConfig) -> int:
+     """How many microbatches a step is split into; 1 when microbatching is off."""
++    # A1：dual 打开时固定 2 个 microbatch（**不设 enable_dbo**，避免 DBO 语义与 MoE 断言）。
++    # 关 dual 时行为与 stock 完全一致。
++    from vllm.v1.worker.workspace import ar_dual_enabled
++
++    if ar_dual_enabled():
++        return 2
+     return parallel_config.num_ubatches if parallel_config.use_ubatching else 1
+ 
+ 
+--- a/vllm/v1/worker/ubatching.py
++++ b/vllm/v1/worker/ubatching.py
+@@ -3,6 +3,7 @@
+ import threading
+ 
+ import torch
++
+ 
+ from vllm import forward_context
+ from vllm.forward_context import ForwardContext
+@@ -197,6 +198,110 @@
+             return func(*args, **kwargs)
+ 
+ 
++class ARLaneContext:
++    """A1 第二刀：TP-only 双 chunk 的执行上下文。
++
++    与 ``UBatchContext`` 的三处**刻意差异**：
++      1. **不写 ``_THREAD_ID_TO_CONTEXT``** ⇒ ``dbo_enabled()`` 恒为 False，
++         MoE 侧 ``assert not dbo_enabled()`` 与 ``if dbo_enabled():`` 分支全部留在 stock 路径；
++      2. **不做 ``cpu_wait_event`` 交接** ⇒ 两个 chunk 真并发，而不是"单 GPU 交替"；
++      3. scratch 隔离改由 **workspace lane**（``use_workspace_lane``）承担。
++
++    ``cpu_wait_event`` 仅为兼容 ``UBatchRunner.finish()`` 的调用而存在，无交接语义。
++    """
++
++    def __init__(
++        self,
++        id: int,
++        compute_stream: torch.cuda.Stream,
++        forward_context: "ForwardContext",
++        ready_barrier: threading.Barrier,
++        lane: int,
++        parent_stream: torch.cuda.Stream | None = None,
++    ):
++        self.id = id
++        # **每个 chunk 一条自己的 compute stream** —— 真并发的前提。
++        # DBO 之所以能共用一个 stream，是因为它靠 cpu_wait_event 交接、任一时刻只有一个 chunk 在跑；
++        # 我们要的是两流同时驻留，共用 stream 只会串行化，trace 里也看不到"跨 lane 重叠"。
++        self.compute_stream = compute_stream
++        self.parent_stream = parent_stream
++        self.start_event = torch.cuda.Event()
++        self.done_event = torch.cuda.Event()
++        self.forward_context = forward_context
++        self.ready_barrier = ready_barrier
++        self.lane = lane
++        self.cpu_wait_event = threading.Event()
++        self._lane_cm = None
++        self._restored_stream = False
++
++    def __enter__(self):
++        _CURRENT_CONTEXTS[self.id] = self
++        self.ready_barrier.wait()
++        forward_context._forward_context = self.forward_context
++        # 惰性导入：workspace.py 已 `from ...ubatching import dbo_current_ubatch_id`，
++        # 模块级互相 import 会成环。
++        from vllm.v1.worker.workspace import use_workspace_lane
++
++        self._lane_cm = use_workspace_lane(self.lane)
++        self._lane_cm.__enter__()
++        if current_stream() != self.compute_stream:
++            torch.cuda.set_stream(self.compute_stream)
++        # 等父流（发起本 step 的流）把输入张量准备好再开跑
++        if self.parent_stream is not None:
++            self.compute_stream.wait_event(self.start_event)
++        return self
++
++    def __exit__(self, exc_type, exc_val, exc_tb):
++        _CURRENT_CONTEXTS[self.id] = None
++        if self._lane_cm is not None:
++            # 让父流等本 chunk 算完（结果张量在父流上被消费）
++            if self.parent_stream is not None:
++                self.done_event.record(self.compute_stream)
++                self.parent_stream.wait_event(self.done_event)
++            self._lane_cm.__exit__(exc_type, exc_val, exc_tb)
++            self._lane_cm = None
++        return False
++
++
++def make_ar_lane_contexts(
++    num_micro_batches: int,
++    compute_stream: torch.cuda.Stream,
++    forward_contexts: list["ForwardContext"],
++    ready_barrier: threading.Barrier,
++) -> list[ARLaneContext]:
++    """为 ``num_micro_batches`` 个 chunk 造 lane 上下文：**chunk i 固定用 lane i**。
++
++    lane 必须是对 (stream, chunk 序号) 的静态函数：CUDA graph 捕获记录的是具体指针，
++    轮换 lane 会让 replay 写进另一条 lane 的 buffer（别名）。
++    """
++    global _NUM_UBATCHES, _CURRENT_CONTEXTS
++    assert num_micro_batches > 1, "num_micro_batches must be greater than 1"
++    _NUM_UBATCHES = num_micro_batches
++    if len(_CURRENT_CONTEXTS) < num_micro_batches:
++        _CURRENT_CONTEXTS.extend([None] * (num_micro_batches - len(_CURRENT_CONTEXTS)))
++    # 每条 lane 一条独立 compute stream；父流用事件与其对齐（入口 wait / 出口 record）。
++    device = compute_stream.device
++    lane_streams = [
++        compute_stream if i == 0 else torch.cuda.Stream(device=device)
++        for i in range(num_micro_batches)
++    ]
++    contexts = [
++        ARLaneContext(
++            id=i,
++            compute_stream=lane_streams[i],
++            forward_context=forward_contexts[i],
++            ready_barrier=ready_barrier,
++            lane=i,
++            parent_stream=compute_stream,
++        )
++        for i in range(num_micro_batches)
++    ]
++    for ctx in contexts:
++        if ctx.compute_stream is not compute_stream:
++            ctx.start_event.record(compute_stream)
++    return contexts
++
++
+ def make_ubatch_contexts(
+     num_micro_batches: int,
+     compute_stream: torch.cuda.Stream,
+--- a/vllm/v1/worker/workspace.py
++++ b/vllm/v1/worker/workspace.py
+@@ -3,6 +3,7 @@
+ 
+ import inspect
+ import os
++import threading
+ from collections.abc import Callable, Hashable, Iterator
+ from contextlib import AbstractContextManager, contextmanager, nullcontext
+ from contextvars import ContextVar
+@@ -32,6 +33,90 @@
+ # Global workspace manager instance
+ _manager: "WorkspaceManager | None" = None
+ _workspace_lane: ContextVar[int] = ContextVar("vllm_workspace_lane", default=0)
++
++
++def ar_lane_count() -> int:
++    """自研双 lane（A1）开关：``V4FLASH_AR_LANES=N``（N>=2）时启用，未设/非法一律返回 1。
++
++    返回 1 表示"完全 stock 行为"：不额外分配 lane、不在 forward 外层包 lane、不打印调试信息。
++    """
++    raw = os.environ.get("V4FLASH_AR_LANES", "")
++    dual = os.environ.get("V4FLASH_AR_DUAL", "0") == "1"
++    if not raw:
++        return 2 if dual else 1
++    try:
++        value = int(raw)
++    except ValueError:
++        return 2 if dual else 1
++    if dual:
++        value = max(value, 2)
++    return value if value > 1 else 1
++
++
++def ar_dual_enabled() -> bool:
++    """A1 第二刀开关：``V4FLASH_AR_DUAL=1`` 时允许 TP-only（DP=1）双 chunk 并发。"""
++    return os.environ.get("V4FLASH_AR_DUAL", "0") == "1"
++
++
++# A5b 退路：attention 阶段在两 lane 之间串行（MoE / all-reduce 仍并行）。
++# 为什么要有它：FlashInfer 的 MLA workspace 在 1.5.x 里是模块级全局，双流并发写同一块 scratch
++# 会**静默算错**。串行后共用一块是安全的，还能省下 a5 的 394 MiB/lane。
++_AR_ATTN_LOCK = threading.Lock()
++_RECOVERY_ATTN_DONE = None
++
++
++def ar_attn_serial_enabled() -> bool:
++    """``V4FLASH_AR_ATTN_SERIAL=1`` 时启用"attention 串行"退路（默认关）。"""
++    return os.environ.get("V4FLASH_AR_ATTN_SERIAL", "0") == "1"
++
++
++def ar_attn_serialized(fn):
++    """把 attention 的前向包进 lane 级互斥（只包 attention 这一小段）。"""
++    import functools
++
++    @functools.wraps(fn)
++    def wrapper(*args, **kwargs):
++        if not ar_attn_serial_enabled():
++            return fn(*args, **kwargs)
++        with _AR_ATTN_LOCK:
++            from vllm.forward_context import get_forward_context
++            if not get_forward_context().additional_kwargs.get("recovery_overlap", False):
++                return fn(*args, **kwargs)
++            # One CPU launch thread; event ordering also protects shared MLA
++            # workspace and earlier-chunk KV/compressor state on the device.
++            global _RECOVERY_ATTN_DONE
++            stream = torch.cuda.current_stream()
++            if _RECOVERY_ATTN_DONE is not None:
++                stream.wait_event(_RECOVERY_ATTN_DONE)
++            return fn(*args, **kwargs)
++
++    return wrapper
++
++
++
++def recovery_attention_workspace_done():
++    """Publish completion of shared MLA workspace/KV use, before o_proj."""
++    from vllm.forward_context import get_forward_context
++    if not get_forward_context().additional_kwargs.get("recovery_overlap", False):
++        return
++    global _RECOVERY_ATTN_DONE
++    event = torch.cuda.Event()
++    event.record(torch.cuda.current_stream())
++    _RECOVERY_ATTN_DONE = event
++
++
++def current_workspace_lane() -> int:
++    """当前执行上下文所在的 workspace lane（未用 ``use_workspace_lane`` 时恒 0）。
++
++    给"进程级全局 scratch"（如 FlashInfer 的 MLA workspace）做按 lane 隔离用。
++    dual 关闭时恒返回 0 ⇒ 与原实现的单份缓存逐字节等价。
++    """
++    return _workspace_lane.get()
++
++
++def ar_debug_enabled() -> bool:
++    """``V4FLASH_AR_DEBUG=1`` 时打印 A1 的调试串（每个被改文件各一条唯一串）。"""
++    return os.environ.get("V4FLASH_AR_DEBUG", "0") == "1"
+ 
+ 
+ @contextmanager
+@@ -129,6 +214,35 @@
+             )
+         return dbo_current_ubatch_id() * self._num_lanes + lane
+ 
++    def ar_snapshot(self) -> list[dict]:
++        """每个 owner 的 workspace 归属快照：lane、scratch 字节数、persistent key 与字节数。
++
++        用于 A1 第二刀的"两 lane 对称"断言：**不等时要把差异打进日志**，
++        而不是只抛一个 assert（否则只知道不对称、不知道哪一侧多了什么）。
++        """
++        snapshot = []
++        for owner in range(self._num_ubatches * self._num_lanes):
++            scratch = self._current_workspaces[owner]
++            resources = self._persistent_resources[owner]
++            key_bytes = 0
++            for value in resources.values():
++                numel = getattr(value, "numel", None)
++                itemsize = getattr(value, "element_size", None)
++                if callable(numel) and callable(itemsize):
++                    key_bytes += int(numel()) * int(itemsize())
++            snapshot.append(
++                {
++                    "owner": owner,
++                    "ubatch": owner // self._num_lanes,
++                    "lane": owner % self._num_lanes,
++                    "scratch_bytes": int(scratch.numel()) if scratch is not None else 0,
++                    "key_count": len(resources),
++                    "key_bytes": key_bytes,
++                    "keys": sorted(str(k) for k in resources),
++                }
++            )
++        return snapshot
++
+     def get_persistent_resource(self, key: Hashable, factory: Callable[[], T]) -> T:
+         """Return the resource cached for ``key`` in the current ubatch and lane.
+ 
+@@ -266,6 +380,16 @@
+                 )
+             current_workspace = self._current_workspaces[workspace_id]
+ 
++            if ar_debug_enabled():
++                logger.info(
++                    "[A1 LANES] owner=%d (ubatch %d, lane %d) ptr=%d size=%.2f MB",
++                    workspace_id,
++                    workspace_id // self._num_lanes,
++                    workspace_id % self._num_lanes,
++                    current_workspace.data_ptr(),
++                    current_workspace.numel() / _MB,
++                )
++
+             if envs.VLLM_DEBUG_WORKSPACE:
+                 logger.info(
+                     "[WORKSPACE DEBUG] Resized workspace from '%s': %.2f MB -> "
+@@ -277,6 +401,16 @@
+                     workspace_id % self._num_lanes,
+                 )
+ 
++        if ar_debug_enabled():
++            logger.info(
++                "[A1 LANES] owner=%d (ubatch %d, lane %d) ptr=%d size=%.2f MB (reused)",
++                workspace_id,
++                workspace_id // self._num_lanes,
++                workspace_id % self._num_lanes,
++                current_workspace.data_ptr(),
++                current_workspace.numel() / _MB,
++            )
++
+         return current_workspace
+ 
+ 

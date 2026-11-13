@@ -1,0 +1,4 @@
+torch==2.13.0
+vllm==0.32.0
+flashinfer-python==0.7.0.post1
+b12x==1.5.1
